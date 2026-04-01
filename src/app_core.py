@@ -1,4 +1,3 @@
-import ctypes
 import logging
 import os
 import queue
@@ -8,7 +7,6 @@ import threading
 import time
 import wave
 from collections.abc import Callable
-from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
 
@@ -16,27 +14,14 @@ import numpy as np
 import pyautogui
 import pyperclip
 import sounddevice as sd
-from pynput.keyboard import Key
+from pynput.keyboard import Key, Controller
 
 import live_overlap_mode
+from os_adapter import get_os_adapter
 
 
 class TranscriptionCancelledError(Exception):
     pass
-
-
-class GUITHREADINFO(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wintypes.DWORD),
-        ("flags", wintypes.DWORD),
-        ("hwndActive", wintypes.HWND),
-        ("hwndFocus", wintypes.HWND),
-        ("hwndCapture", wintypes.HWND),
-        ("hwndMenuOwner", wintypes.HWND),
-        ("hwndMoveSize", wintypes.HWND),
-        ("hwndCaret", wintypes.HWND),
-        ("rcCaret", wintypes.RECT),
-    ]
 
 
 def _to_int_if_numeric(value):
@@ -419,22 +404,20 @@ class LocalSTTCore:
             if effective is None:
                 logging.error("No input microphone device found")
                 return
-            info = sd.query_devices(effective, "input")
+            info = sd.query_devices(effective)
+            # Make sure it actually has input channels, otherwise it's an output device
+            if int(info.get("max_input_channels", 0)) == 0:
+                logging.warning(f"Device '{info.get('name', effective)}' has 0 input channels. Falling back to default.")
+                self.config.input_device = None
+                effective = self._get_effective_input_device()
+                info = sd.query_devices(effective) if effective is not None else {}
+                
             logging.info("Using microphone: %s", info.get("name", effective))
         except Exception:
             logging.exception("Could not resolve input device")
 
     def _release_modifiers(self) -> None:
-        for key in [Key.ctrl, Key.shift, Key.alt, Key.cmd]:
-            try:
-                self.keyboard_controller.release(key)
-            except Exception:
-                pass
-        for key_name in ["ctrl", "shift", "alt", "winleft", "winright"]:
-            try:
-                pyautogui.keyUp(key_name)
-            except Exception:
-                pass
+        self.os_adapter.release_modifiers()
 
     def _drain_audio_queue(self) -> None:
         while not self.audio_queue.empty():
@@ -685,45 +668,16 @@ class LocalSTTCore:
             self.recording_audio_event.set()
 
     def _get_foreground_window(self) -> int | None:
-        try:
-            hwnd = int(ctypes.windll.user32.GetForegroundWindow())
-            return hwnd if hwnd != 0 else None
-        except Exception:
-            return None
+        return self.os_adapter.get_foreground_window()
 
     def _get_window_title(self, hwnd: int | None) -> str:
-        if hwnd is None:
-            return ""
-        try:
-            user32 = ctypes.windll.user32
-            length = int(user32.GetWindowTextLengthW(hwnd))
-            if length <= 0:
-                return ""
-            buf = ctypes.create_unicode_buffer(length + 1)
-            user32.GetWindowTextW(hwnd, buf, length + 1)
-            return buf.value
-        except Exception:
-            return ""
+        return self.os_adapter.get_window_title(hwnd)
 
     def _get_window_class(self, hwnd: int | None) -> str:
-        if hwnd is None:
-            return ""
-        try:
-            buf = ctypes.create_unicode_buffer(256)
-            ctypes.windll.user32.GetClassNameW(hwnd, buf, 255)
-            return buf.value
-        except Exception:
-            return ""
+        return self.os_adapter.get_window_class(hwnd)
 
     def _get_window_pid(self, hwnd: int | None) -> int | None:
-        if hwnd is None:
-            return None
-        try:
-            pid = wintypes.DWORD(0)
-            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            return int(pid.value)
-        except Exception:
-            return None
+        return self.os_adapter.get_window_pid(hwnd)
 
     def _describe_window(self, hwnd: int | None) -> str:
         if hwnd is None:
@@ -751,81 +705,10 @@ class LocalSTTCore:
         )
 
     def _get_focused_control(self, hwnd: int | None) -> int | None:
-        if hwnd is None:
-            return None
-        try:
-            user32 = ctypes.windll.user32
-            thread_id = int(user32.GetWindowThreadProcessId(hwnd, None))
-            if thread_id == 0:
-                return None
-            gui_info = GUITHREADINFO()
-            gui_info.cbSize = ctypes.sizeof(GUITHREADINFO)
-            ok = bool(user32.GetGUIThreadInfo(thread_id, ctypes.byref(gui_info)))
-            if not ok:
-                return None
-            focus = int(gui_info.hwndFocus)
-            return focus if focus != 0 else None
-        except Exception:
-            return None
+        return self.os_adapter.get_focused_control(hwnd)
 
     def _activate_window(self, hwnd: int | None) -> None:
-        if hwnd is None:
-            return
-        try:
-            user32 = ctypes.windll.user32
-            kernel32 = ctypes.windll.kernel32
-            if user32.IsIconic(hwnd):
-                user32.ShowWindow(hwnd, 9)
-
-            current_foreground = user32.GetForegroundWindow()
-            current_thread = user32.GetWindowThreadProcessId(current_foreground, None)
-            target_thread = user32.GetWindowThreadProcessId(hwnd, None)
-            this_thread = kernel32.GetCurrentThreadId()
-
-            attached_current = False
-            attached_target = False
-            try:
-                if current_thread and current_thread != this_thread:
-                    attached_current = bool(user32.AttachThreadInput(this_thread, current_thread, True))
-                if target_thread and target_thread != this_thread:
-                    attached_target = bool(user32.AttachThreadInput(this_thread, target_thread, True))
-
-                user32.BringWindowToTop(hwnd)
-                user32.SetForegroundWindow(hwnd)
-                user32.SetFocus(hwnd)
-                if self.target_focus_hwnd is not None:
-                    user32.SetFocus(self.target_focus_hwnd)
-                time.sleep(0.06)
-            finally:
-                if attached_current:
-                    user32.AttachThreadInput(this_thread, current_thread, False)
-                if attached_target:
-                    user32.AttachThreadInput(this_thread, target_thread, False)
-        except Exception:
-            logging.warning("Could not activate target window")
-
-    def _send_vk(self, vk: int, key_up: bool = False) -> None:
-        flags = 0x0002 if key_up else 0
-        ctypes.windll.user32.keybd_event(vk, 0, flags, 0)
-
-    def _send_shortcut_vk(self, modifier_vk: int, key_vk: int) -> None:
-        self._send_vk(modifier_vk, key_up=False)
-        time.sleep(0.01)
-        self._send_vk(key_vk, key_up=False)
-        time.sleep(0.01)
-        self._send_vk(key_vk, key_up=True)
-        time.sleep(0.01)
-        self._send_vk(modifier_vk, key_up=True)
-
-    def _send_wm_paste(self, hwnd: int | None) -> bool:
-        if hwnd is None:
-            return False
-        try:
-            ctypes.windll.user32.SendMessageW(hwnd, 0x0302, 0, 0)
-            return True
-        except Exception:
-            logging.exception("WM_PASTE failed")
-            return False
+        self.os_adapter.activate_window(hwnd, self.target_focus_hwnd)
 
     def _generate_audio_path(self) -> Path:
         return self.recordings_dir / f"recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
@@ -891,15 +774,9 @@ class LocalSTTCore:
             self._show_popup("UNDO TARGET UNAVAILABLE", bg="#9a1b1b")
             return
 
-        self.target_hwnd = self.last_paste_target_hwnd
-        self.target_focus_hwnd = self.last_paste_target_focus_hwnd
-        self._activate_window(self.last_paste_target_hwnd)
-        time.sleep(max(0.2, self.config.paste_delay_sec))
-        self._release_modifiers()
-        time.sleep(0.05)
-        self._send_shortcut_vk(0x11, 0x5A)
+        self.os_adapter.send_undo(self.last_paste_target_hwnd, self.last_paste_target_focus_hwnd)
         self.last_paste_can_undo = False
-        logging.info("Undo shortcut sent to last paste target")
+        logging.info("Undo command sent to last paste target")
         self._set_status("Undo sent to target")
         self._show_popup("UNDO SENT", bg="#1e6b2d")
 
@@ -1119,22 +996,25 @@ class LocalSTTCore:
         except Exception:
             logging.warning("Could not read clipboard")
 
-        pyperclip.copy(text)
-        time.sleep(max(0.25, self.config.paste_delay_sec))
-
         if self.target_hwnd is None:
             self.target_hwnd = self._get_foreground_window()
 
-        self._activate_window(self.target_hwnd)
-        time.sleep(max(0.3, self.config.paste_delay_sec))
-        self._release_modifiers()
-        time.sleep(0.08)
+        is_app_target = False
+        if self.target_hwnd is not None:
+            if self._get_window_pid(self.target_hwnd) == os.getpid():
+                is_app_target = True
 
-        self._send_wm_paste(self.target_hwnd)
-        time.sleep(max(0.12, self.config.paste_delay_sec))
-        self._send_shortcut_vk(0x11, 0x56)
-        time.sleep(max(0.12, self.config.paste_delay_sec))
-        self._send_shortcut_vk(0x10, 0x2D)
+        if is_app_target:
+            logging.info("Target window is the application itself. Text copied to clipboard only.")
+            pyperclip.copy(text)
+            self._set_status("Text copied to clipboard")
+            return
+
+        pyperclip.copy(text)
+        time.sleep(max(0.25, self.config.paste_delay_sec))
+
+        # Target focus should be captured before starting recording or during _capture_target_window
+        self.os_adapter.send_paste(self.target_hwnd)
 
         self.last_pasted_text = text
         self.last_paste_target_hwnd = self.target_hwnd
