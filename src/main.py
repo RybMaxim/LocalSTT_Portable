@@ -22,6 +22,11 @@ from app_core import LocalSTTCore
 
 CTRL_KEYS = {keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r}
 SHIFT_KEYS = {keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r}
+HOTKEY_SCANS = {
+    0x10: "toggle_recording",  # Physical Q key position
+    0x11: "transcribe_last",   # Physical W key position
+    0x12: "shutdown",          # Physical E key position
+}
 COMMON_LANGUAGE_OPTIONS: list[tuple[str, str]] = [
     ("Auto detect", "auto"),
     ("English (en)", "en"),
@@ -45,6 +50,18 @@ COMMON_TRANSCRIPTION_MODE_OPTIONS: list[tuple[str, str]] = [
     ("Live overlap during recording (experimental)", "live-overlap"),
 ]
 TRANSCRIPTION_MODE_LABEL_TO_CODE = {label: code for label, code in COMMON_TRANSCRIPTION_MODE_OPTIONS}
+COMMON_MODEL_OPTIONS: list[tuple[str, str]] = [
+    ("Tiny (fastest, lowest accuracy)", "tiny"),
+    ("Small (balanced, default)", "small"),
+    ("Medium (slower, higher accuracy)", "medium"),
+]
+MODEL_LABEL_TO_CODE = {label: code for label, code in COMMON_MODEL_OPTIONS}
+MODEL_CODE_TO_LABEL = {code: label for label, code in COMMON_MODEL_OPTIONS}
+MODEL_CODE_TO_PATH = {
+    "tiny": "models/faster-whisper-tiny",
+    "small": "models/faster-whisper-small",
+    "medium": "models/faster-whisper-medium",
+}
 TRANSCRIPTION_HISTORY_LIMIT = 10
 SUPPORTED_LANGUAGE_CODES = {
     "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl", "ar", "sv",
@@ -96,6 +113,54 @@ def _normalize_transcription_mode(value: Any, fallback: str = "full-file") -> st
     if cleaned in {"live", "live-overlap", "live_overlap", "stream", "semi-stream", "semi-streaming"}:
         return "live-overlap"
     return fallback
+
+
+def _normalize_model_size(value: Any, fallback: str = "small") -> str:
+    if value is None:
+        return fallback
+
+    raw = str(value).strip()
+    if not raw:
+        return fallback
+    if raw in MODEL_LABEL_TO_CODE:
+        return MODEL_LABEL_TO_CODE[raw]
+
+    cleaned = raw.lower().replace("_", "-")
+    if cleaned in MODEL_CODE_TO_LABEL:
+        return cleaned
+    if cleaned.endswith("faster-whisper-tiny") or cleaned.endswith("/tiny") or cleaned.endswith("\\tiny"):
+        return "tiny"
+    if cleaned.endswith("faster-whisper-small") or cleaned.endswith("/small") or cleaned.endswith("\\small"):
+        return "small"
+    if cleaned.endswith("faster-whisper-medium") or cleaned.endswith("/medium") or cleaned.endswith("\\medium"):
+        return "medium"
+    return fallback
+
+
+def _model_size_from_path(value: Any, fallback: str = "") -> str:
+    if value is None:
+        return fallback
+    raw = str(value).strip()
+    if not raw:
+        return fallback
+    normalized = raw.replace("\\", "/").rstrip("/").lower()
+    if normalized.endswith("faster-whisper-tiny"):
+        return "tiny"
+    if normalized.endswith("faster-whisper-small"):
+        return "small"
+    if normalized.endswith("faster-whisper-medium"):
+        return "medium"
+    return fallback
+
+
+def _model_display_value(model_size: str) -> str:
+    normalized = _normalize_model_size(model_size)
+    return MODEL_CODE_TO_LABEL.get(normalized, normalized)
+
+
+def _model_path_for_size(model_size: str) -> str:
+    normalized = _normalize_model_size(model_size)
+    return MODEL_CODE_TO_PATH.get(normalized, MODEL_CODE_TO_PATH["small"])
 
 
 @dataclass
@@ -172,6 +237,8 @@ class LocalSTTApp(LocalSTTCore):
         self.target_focus_hwnd: int | None = None
         self.action_lock = threading.Lock()
         self.recording_started_at: float | None = None
+        self.transcription_started_at: float | None = None
+        self.transcription_target_duration_sec: float | None = None
         self.transcription_cancel_event = threading.Event()
         self.last_pasted_text: str | None = None
         self.last_paste_target_hwnd: int | None = None
@@ -202,32 +269,26 @@ class LocalSTTApp(LocalSTTCore):
         self.ui_mic_test_btn = None
         self.ui_vad_var = None
         self.ui_restore_clipboard_var = None
+        self.ui_model_var = None
+        self.ui_model_combo = None
         self.ui_language_var = None
         self.ui_language_combo = None
         self.ui_status_var = None
         self.ui_toast_window = None
         self.ui_toast_label = None
         self.ui_toast_timer_id = None
+        self.ui_popup_timer_mode: str | None = None
+        self.ui_popup_base_text = ""
         self.ui_cancel_transcription_btn = None
         self.ui_repeat_paste_btn = None
         self.ui_undo_paste_btn = None
         self.ui_history_text = None
 
         self._load_settings_from_file()
+        self._sync_model_config()
         self._load_history_from_file()
 
-        model_source, local_files_only = self._resolve_model_source()
-        if self.config.offline_only:
-            os.environ.setdefault("HF_HUB_OFFLINE", "1")
-
-        logging.info("Loading faster-whisper model from: %s", model_source)
-        self.model = WhisperModel(
-            model_source,
-            device=self.config.device,
-            compute_type=self.config.compute_type,
-            local_files_only=local_files_only,
-        )
-        logging.info("Model loaded")
+        self.model = self._load_whisper_model()
 
         self.input_device = self._resolve_input_device(self.config.input_device)
         self._log_audio_input_info()
@@ -237,19 +298,28 @@ class LocalSTTApp(LocalSTTCore):
             0x57: ("transcribe_last", self.transcribe_last_file),
             0x45: ("shutdown", self.shutdown),
         }
-        self.hotkey_actions_by_char: dict[str, tuple[str, Any]] = {
-            "q": ("toggle_recording", self.toggle_recording),
-            "w": ("transcribe_last", self.transcribe_last_file),
-            "e": ("shutdown", self.shutdown),
-            "й": ("toggle_recording", self.toggle_recording),
-            "ц": ("transcribe_last", self.transcribe_last_file),
-            "у": ("shutdown", self.shutdown),
+        self.hotkey_actions_by_scan: dict[int, tuple[str, Any]] = {
+            0x10: ("toggle_recording", self.toggle_recording),
+            0x11: ("transcribe_last", self.transcribe_last_file),
+            0x12: ("shutdown", self.shutdown),
         }
 
         self.hotkeys = keyboard.Listener(
             on_press=self._on_hotkey_press,
             on_release=self._on_hotkey_release,
         )
+
+    def _key_scan(self, key) -> int | None:
+        try:
+            scan = getattr(key, "_scan", None)
+            if scan is None:
+                value = getattr(key, "value", None)
+                scan = getattr(value, "_scan", None)
+            if scan is None:
+                return None
+            return int(scan)
+        except Exception:
+            return None
 
     def _key_vk(self, key) -> int | None:
         try:
@@ -260,23 +330,14 @@ class LocalSTTApp(LocalSTTCore):
         except Exception:
             return None
 
-    def _key_char(self, key) -> str | None:
-        try:
-            char = getattr(key, "char", None)
-            if char is None:
-                return None
-            return str(char).lower()
-        except Exception:
-            return None
-
     def _resolve_hotkey_action(self, key) -> tuple[str, Any] | None:
+        scan = self._key_scan(key)
+        if scan is not None and scan in self.hotkey_actions_by_scan:
+            return self.hotkey_actions_by_scan[scan]
+
         vk = self._key_vk(key)
         if vk is not None and vk in self.hotkey_actions_by_vk:
             return self.hotkey_actions_by_vk[vk]
-
-        char = self._key_char(key)
-        if char is not None and char in self.hotkey_actions_by_char:
-            return self.hotkey_actions_by_char[char]
 
         return None
 
@@ -356,6 +417,117 @@ class LocalSTTApp(LocalSTTCore):
         queue_handler = QueueLogHandler(self.log_queue)
         queue_handler.setFormatter(formatter)
         logger.addHandler(queue_handler)
+
+    def _sync_model_config(self) -> None:
+        fallback_model_size = _model_size_from_path(self.config.model_path, fallback="small")
+        self.config.model_size = _normalize_model_size(self.config.model_size, fallback=fallback_model_size)
+        if _model_size_from_path(self.config.model_path, fallback=""):
+            self.config.model_path = _model_path_for_size(self.config.model_size)
+
+    def _available_model_codes(self) -> list[str]:
+        available_codes: list[str] = []
+        for code, model_path in MODEL_CODE_TO_PATH.items():
+            if self._resolve_existing_path(model_path) is not None:
+                available_codes.append(code)
+
+        current_code = _normalize_model_size(
+            self.config.model_size,
+            fallback=_model_size_from_path(self.config.model_path, fallback=""),
+        )
+        if current_code and current_code not in available_codes:
+            available_codes.insert(0, current_code)
+
+        return available_codes or list(MODEL_CODE_TO_PATH)
+
+    def _set_model_ui_value(self, model_size: str) -> None:
+        if self.ui_root is None or self.ui_model_var is None:
+            return
+        label = _model_display_value(model_size)
+        try:
+            self.ui_root.after(0, lambda: self.ui_model_var.set(label))
+        except Exception:
+            pass
+
+    def _apply_selected_model(self, model_size: str) -> None:
+        normalized = _normalize_model_size(model_size, fallback="")
+        if not normalized:
+            raise ValueError("Unsupported model selection")
+        self.config.model_size = normalized
+        self.config.model_path = _model_path_for_size(normalized)
+
+    def _load_whisper_model(self) -> WhisperModel:
+        model_source, local_files_only = self._resolve_model_source()
+        if self.config.offline_only:
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+        logging.info("Loading faster-whisper model from: %s", model_source)
+        model = WhisperModel(
+            model_source,
+            device=self.config.device,
+            compute_type=self.config.compute_type,
+            local_files_only=local_files_only,
+        )
+        logging.info("Model loaded")
+        return model
+
+    def _apply_user_settings(
+        self,
+        *,
+        vad_filter: bool,
+        restore_clipboard: bool,
+        transcription_language: str,
+        model_size: str,
+    ) -> None:
+        previous_model_size = self.config.model_size
+        previous_model_path = self.config.model_path
+
+        self.config.vad_filter = vad_filter
+        self.config.restore_clipboard = restore_clipboard
+        self.config.transcription_language = transcription_language
+
+        normalized_model_size = _normalize_model_size(model_size, fallback="")
+        if not normalized_model_size:
+            self._set_status("Unsupported model")
+            self._show_popup("UNSUPPORTED MODEL", bg="#9a1b1b")
+            self._set_model_ui_value(previous_model_size)
+            return
+
+        model_changed = normalized_model_size != previous_model_size
+        if not model_changed:
+            self._save_settings_to_file()
+            self._set_status("Settings saved")
+            return
+
+        if self.is_recording or self.is_transcribing:
+            self._save_settings_to_file()
+            self._set_model_ui_value(previous_model_size)
+            self._set_status("Stop the active job before switching model")
+            self._show_popup("STOP ACTIVE JOB FIRST", bg="#9a1b1b")
+            return
+
+        self._set_status(f"Loading {normalized_model_size} model...")
+        self._show_popup(f"LOADING {normalized_model_size.upper()} MODEL", bg="#5d2f87", persistent=True)
+
+        try:
+            self._apply_selected_model(normalized_model_size)
+            new_model = self._load_whisper_model()
+        except Exception:
+            self.config.model_size = previous_model_size
+            self.config.model_path = previous_model_path
+            self._save_settings_to_file()
+            self._set_model_ui_value(previous_model_size)
+            self._hide_popup()
+            logging.exception("Failed to switch model")
+            self._set_status(f"Failed to load {normalized_model_size} model")
+            self._show_popup("MODEL LOAD FAILED", bg="#9a1b1b")
+            return
+
+        self.model = new_model
+        self._save_settings_to_file()
+        self._set_model_ui_value(self.config.model_size)
+        self._hide_popup()
+        self._set_status(f"Model switched to {self.config.model_size}")
+        self._show_popup(f"MODEL: {self.config.model_size.upper()}", bg="#1e6b2d")
 
     def _load_settings_from_file(self) -> None:
         try:
@@ -536,8 +708,16 @@ class LocalSTTApp(LocalSTTCore):
                 pass
         logging.info("STATUS: %s", text)
 
-    def _show_popup(self, text: str, bg: str = "#1e6b2d", persistent: bool = False) -> None:
-        self.popup_queue.put(("show", {"text": text, "bg": bg, "persistent": persistent}))
+    def _show_popup(
+        self,
+        text: str,
+        bg: str = "#1e6b2d",
+        persistent: bool = False,
+        timer_mode: str | None = None,
+    ) -> None:
+        self.popup_queue.put(
+            ("show", {"text": text, "bg": bg, "persistent": persistent, "timer_mode": timer_mode})
+        )
 
     def _hide_popup(self) -> None:
         self.popup_queue.put(("hide", {}))
@@ -565,6 +745,13 @@ class LocalSTTApp(LocalSTTCore):
                 text = str(payload.get("text", ""))
                 bg = str(payload.get("bg", "#1e6b2d"))
                 persistent = bool(payload.get("persistent", False))
+                timer_mode = payload.get("timer_mode")
+                if timer_mode is None:
+                    self.ui_popup_timer_mode = None
+                else:
+                    normalized_timer_mode = str(timer_mode).strip().lower()
+                    self.ui_popup_timer_mode = normalized_timer_mode or None
+                self.ui_popup_base_text = text
 
                 self.ui_toast_label.configure(text=text, bg=bg)
                 self.ui_toast_window.configure(bg=bg)
@@ -583,17 +770,41 @@ class LocalSTTApp(LocalSTTCore):
 
             elif action == "hide":
                 _cancel_timer()
+                self.ui_popup_timer_mode = None
+                self.ui_popup_base_text = ""
                 self.ui_toast_window.withdraw()
+
+    def _format_popup_elapsed(self, elapsed_sec: int, target_sec: float | None = None) -> str:
+        minutes = elapsed_sec // 60
+        seconds = elapsed_sec % 60
+        if target_sec is None or target_sec <= 0:
+            return f"{minutes:02d}:{seconds:02d}"
+
+        target_total_sec = max(0, int(round(target_sec)))
+        target_minutes = target_total_sec // 60
+        target_seconds = target_total_sec % 60
+        return f"{minutes:02d}:{seconds:02d} / {target_minutes:02d}:{target_seconds:02d}"
 
     def _update_recording_popup_timer(self) -> None:
         if self.ui_toast_window is None or self.ui_toast_label is None:
             return
-        if not self.is_recording or self.recording_started_at is None:
+
+        if self.ui_popup_timer_mode == "recording":
+            if not self.is_recording or self.recording_started_at is None:
+                return
+            elapsed_sec = max(0, int(time.perf_counter() - self.recording_started_at))
+            timer_text = self._format_popup_elapsed(elapsed_sec)
+            base_text = self.ui_popup_base_text or "RECORDING..."
+            self.ui_toast_label.configure(text=f"{base_text} {timer_text}")
             return
-        elapsed_sec = max(0, int(time.perf_counter() - self.recording_started_at))
-        minutes = elapsed_sec // 60
-        seconds = elapsed_sec % 60
-        self.ui_toast_label.configure(text=f"RECORDING... {minutes:02d}:{seconds:02d}")
+
+        if self.ui_popup_timer_mode == "transcribing":
+            if not self.is_transcribing or self.transcription_started_at is None:
+                return
+            elapsed_sec = max(0, int(time.perf_counter() - self.transcription_started_at))
+            timer_text = self._format_popup_elapsed(elapsed_sec, self.transcription_target_duration_sec)
+            base_text = self.ui_popup_base_text or "TRANSCRIBING..."
+            self.ui_toast_label.configure(text=f"{base_text} {timer_text}")
 
     def _mic_test_callback(self, indata: np.ndarray, frames: int, callback_time, status) -> None:
         if status:
@@ -707,6 +918,49 @@ class LocalSTTApp(LocalSTTCore):
         elif items:
             self.ui_mic_var.set(items[0])
 
+    def _copy_text_widget_selection(self, widget) -> str:
+        try:
+            selected_text = widget.get("sel.first", "sel.last")
+        except Exception:
+            return "break"
+
+        try:
+            widget.clipboard_clear()
+            widget.clipboard_append(selected_text)
+        except Exception:
+            logging.exception("Failed to copy selected text from UI widget")
+        return "break"
+
+    def _handle_readonly_text_copy_shortcut(self, widget, event) -> str | None:
+        keycode = getattr(event, "keycode", None)
+        keysym = str(getattr(event, "keysym", "") or "").casefold()
+        char = str(getattr(event, "char", "") or "").casefold()
+
+        if keycode == 67:
+            return self._copy_text_widget_selection(widget)
+        if keysym in {"c", "с", "cyrillic_es"}:
+            return self._copy_text_widget_selection(widget)
+        if char in {"c", "с"}:
+            return self._copy_text_widget_selection(widget)
+        return None
+
+    def _bind_readonly_text_widget(self, widget) -> None:
+        widget.configure(exportselection=False, takefocus=True)
+
+        def _focus_widget(_event) -> None:
+            try:
+                widget.focus_set()
+            except Exception:
+                pass
+
+        widget.bind("<ButtonRelease-1>", _focus_widget, add="+")
+        widget.bind(
+            "<Control-KeyPress>",
+            lambda event: self._handle_readonly_text_copy_shortcut(widget, event),
+            add="+",
+        )
+        widget.bind("<Control-Insert>", lambda _event: self._copy_text_widget_selection(widget), add="+")
+
     def _ui_poll(self) -> None:
         if self.stop_event.is_set() or self.ui_root is None:
             return
@@ -807,8 +1061,8 @@ class LocalSTTApp(LocalSTTCore):
         toast.attributes("-topmost", True)
         toast.withdraw()
 
-        toast_w = 280
-        toast_h = 42
+        toast_w = 460
+        toast_h = 46
         toast_x = max(0, (screen_w - toast_w) // 2)
         toast_y = 40
         toast.geometry(f"{toast_w}x{toast_h}+{toast_x}+{toast_y}")
@@ -845,6 +1099,7 @@ class LocalSTTApp(LocalSTTCore):
 
         log_text = tk.Text(tab_logs, wrap="word", font=("Consolas", 8), state="disabled")
         log_text.pack(fill="both", expand=True, padx=6, pady=6)
+        self._bind_readonly_text_widget(log_text)
         self.ui_log_text = log_text
 
         history_frame = ttk.Frame(tab_history, padding=6)
@@ -866,6 +1121,7 @@ class LocalSTTApp(LocalSTTCore):
             yscrollcommand=history_scrollbar.set,
         )
         history_text.pack(side="left", fill="both", expand=True)
+        self._bind_readonly_text_widget(history_text)
         history_scrollbar.configure(command=history_text.yview)
         self.ui_history_text = history_text
 
@@ -874,11 +1130,11 @@ class LocalSTTApp(LocalSTTCore):
         desc.insert(
             "1.0",
             "LocalSTT portable\n\n"
-            "Hotkeys:\n"
+            "Hotkeys (bound to physical Q / W / E key positions, independent of layout):\n"
             "Ctrl+Shift+Q - start/stop recording\n"
             "Ctrl+Shift+W - transcribe last recording\n"
             "Ctrl+Shift+E - exit\n\n"
-            "Russian keyboard layout is also supported: Й / Ц / У.\n\n"
+            "In Russian layout these are the same physical keys where Й / Ц / У are printed.\n\n"
             "Default mode transcribes the whole recorded WAV after stop.\n"
             "An experimental live-overlap mode is still available through config if you want to compare it later.\n\n"
             "Set a preferred transcription language in settings to avoid language guessing.\n\n"
@@ -890,6 +1146,7 @@ class LocalSTTApp(LocalSTTCore):
             "The History tab keeps the last 10 transcription results."
         )
         desc.configure(state="disabled")
+        self._bind_readonly_text_widget(desc)
 
         mic_frame = ttk.Frame(tab_mic, padding=6)
         mic_frame.pack(fill="both", expand=True)
@@ -914,7 +1171,22 @@ class LocalSTTApp(LocalSTTCore):
 
         self.ui_vad_var = tk.BooleanVar(value=self.config.vad_filter)
         self.ui_restore_clipboard_var = tk.BooleanVar(value=self.config.restore_clipboard)
+        self.ui_model_var = tk.StringVar(value=_model_display_value(self.config.model_size))
         self.ui_language_var = tk.StringVar(value=_language_display_value(self.config.transcription_language))
+
+        ttk.Label(mic_frame, text="Speech model:").pack(anchor="w", pady=(8, 2))
+        model_combo = ttk.Combobox(
+            mic_frame,
+            textvariable=self.ui_model_var,
+            values=[_model_display_value(code) for code in self._available_model_codes()],
+            state="readonly",
+        )
+        model_combo.pack(fill="x")
+        self.ui_model_combo = model_combo
+        ttk.Label(
+            mic_frame,
+            text="Only locally downloaded models are listed. Switching reloads the model and can take a few seconds.",
+        ).pack(anchor="w", pady=(2, 6))
 
         ttk.Label(mic_frame, text="Preferred transcription language:").pack(anchor="w", pady=(8, 2))
         language_combo = ttk.Combobox(
@@ -938,13 +1210,31 @@ class LocalSTTApp(LocalSTTCore):
                 self._set_status("Unsupported language code")
                 self._show_popup("UNSUPPORTED LANGUAGE CODE", bg="#9a1b1b")
                 return
-            self.config.vad_filter = bool(self.ui_vad_var.get())
-            self.config.restore_clipboard = bool(self.ui_restore_clipboard_var.get())
-            self.config.transcription_language = selected_language
+
+            selected_model = _normalize_model_size(
+                self.ui_model_var.get() if self.ui_model_var is not None else self.config.model_size,
+                fallback="",
+            )
+            if not selected_model:
+                self._set_status("Unsupported model")
+                self._show_popup("UNSUPPORTED MODEL", bg="#9a1b1b")
+                return
+
+            vad_filter = bool(self.ui_vad_var.get())
+            restore_clipboard = bool(self.ui_restore_clipboard_var.get())
             if self.ui_language_var is not None:
                 self.ui_language_var.set(_language_display_value(selected_language))
-            self._save_settings_to_file()
-            self._set_status("Settings saved")
+            if self.ui_model_var is not None:
+                self.ui_model_var.set(_model_display_value(selected_model))
+            self._dispatch_ui_action(
+                "save_settings",
+                lambda: self._apply_user_settings(
+                    vad_filter=vad_filter,
+                    restore_clipboard=restore_clipboard,
+                    transcription_language=selected_language,
+                    model_size=selected_model,
+                ),
+            )
 
         ttk.Checkbutton(mic_frame, text="VAD filter", variable=self.ui_vad_var).pack(anchor="w")
         ttk.Checkbutton(
@@ -1031,7 +1321,7 @@ class LocalSTTApp(LocalSTTCore):
 
     def run(self) -> None:
         logging.info("LocalSTT started")
-        logging.info("Hotkeys: Ctrl+Shift+Q/W/E and Ctrl+Shift+Й/Ц/У")
+        logging.info("Hotkeys: Ctrl+Shift + physical Q/W/E keys (same positions as Й/Ц/У)")
         self.hotkeys.start()
         self._build_ui()
         logging.info("LocalSTT stopped")
@@ -1074,11 +1364,7 @@ def main() -> None:
     )
 
     if "LOCALSTT_MODEL_PATH" not in os.environ:
-        size_to_path = {
-            "small": "models/faster-whisper-small",
-            "medium": "models/faster-whisper-medium",
-        }
-        config.model_path = size_to_path.get(config.model_size, config.model_path)
+        config.model_path = _model_path_for_size(config.model_size)
 
     app = LocalSTTApp(config)
     app.run()

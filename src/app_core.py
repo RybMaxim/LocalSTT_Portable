@@ -303,6 +303,27 @@ class LocalSTTCore:
 
         return self.config.model_size, False
 
+    def _audio_duration_sec(self, audio_path: Path) -> float | None:
+        try:
+            with wave.open(str(audio_path), "rb") as wav_file:
+                frame_count = int(wav_file.getnframes())
+                sample_rate = int(wav_file.getframerate())
+            if frame_count <= 0 or sample_rate <= 0:
+                return None
+            return frame_count / float(sample_rate)
+        except Exception:
+            logging.exception("Failed to read audio duration from: %s", audio_path)
+            return None
+
+    def _set_transcribing_state(self, active: bool, audio_duration_sec: float | None = None) -> None:
+        self.is_transcribing = active
+        if active:
+            self.transcription_started_at = time.perf_counter()
+            self.transcription_target_duration_sec = audio_duration_sec
+        else:
+            self.transcription_started_at = None
+            self.transcription_target_duration_sec = None
+
     def _audio_callback(self, indata: np.ndarray, frames: int, callback_time, status) -> None:
         if status:
             logging.warning("Audio status: %s", status)
@@ -499,13 +520,13 @@ class LocalSTTCore:
             cancel_event=self.transcription_cancel_event,
             on_status=self._set_status,
         )
-        self.is_transcribing = True
+        self._set_transcribing_state(True)
         self.live_mode_session.start()
 
     def _finish_live_mode_session(self, duration_sec: float) -> None:
         session = getattr(self, "live_mode_session", None)
         self.live_mode_session = None
-        self.is_transcribing = False
+        self._set_transcribing_state(False)
 
         if session is None:
             self._set_status("Experimental mode session missing")
@@ -594,7 +615,7 @@ class LocalSTTCore:
         self.live_transcription_error = None
         self.live_transcription_cancelled = False
         self.transcription_cancel_event.clear()
-        self.is_transcribing = True
+        self._set_transcribing_state(True)
         self.live_transcription_thread = threading.Thread(target=self._live_transcription_worker, daemon=True)
         self.live_transcription_thread.start()
 
@@ -681,7 +702,7 @@ class LocalSTTCore:
             self.live_transcription_error = exc
             logging.exception("Live transcription failed")
         finally:
-            self.is_transcribing = False
+            self._set_transcribing_state(False)
             self.recording_audio_event.set()
 
     def _get_foreground_window(self) -> int | None:
@@ -924,7 +945,7 @@ class LocalSTTCore:
         self.live_transcription_error = None
         self.live_transcription_cancelled = False
         self.live_mode_session = None
-        self.is_transcribing = False
+        self._set_transcribing_state(False)
         self.transcription_cancel_event.clear()
 
         try:
@@ -936,12 +957,12 @@ class LocalSTTCore:
                 self._start_live_mode_session()
             logging.info("Recording started (device=%s, samplerate=%s)", chosen_device, chosen_rate)
             self._set_status("Recording...")
-            self._show_popup("RECORDING...", bg="#9a1b1b", persistent=True)
+            self._show_popup("RECORDING...", bg="#9a1b1b", persistent=True, timer_mode="recording")
         except Exception:
             logging.exception("Failed to start recording")
             self._set_status("Microphone open failed")
             self._show_popup("MICROPHONE OPEN FAILED", bg="#9a1b1b")
-            self.is_transcribing = False
+            self._set_transcribing_state(False)
 
     def stop_recording(self) -> None:
         if not self.is_recording:
@@ -981,7 +1002,7 @@ class LocalSTTCore:
             return
 
         self._set_status("Transcribing...")
-        self._show_popup("TRANSCRIBING FULL FILE...", bg="#0d5f8a", persistent=True)
+        self._show_popup("TRANSCRIBING FULL FILE...", bg="#0d5f8a", persistent=True, timer_mode="transcribing")
         self.transcribe_file_async(output_path)
 
     def toggle_recording(self) -> None:
@@ -1003,7 +1024,7 @@ class LocalSTTCore:
                 self._show_popup("NO LAST RECORDING", bg="#7d5a11")
                 return
             self._set_status("Transcribing...")
-            self._show_popup("TRANSCRIBING LAST FILE...", bg="#0d5f8a")
+            self._show_popup("TRANSCRIBING LAST FILE...", bg="#0d5f8a", persistent=True, timer_mode="transcribing")
             self.transcribe_file_async(self.last_audio_file)
         except Exception:
             logging.exception("Transcribe last failed")
@@ -1014,10 +1035,10 @@ class LocalSTTCore:
             logging.warning("Transcription already in progress")
             return
         self.transcription_cancel_event.clear()
+        self._set_transcribing_state(True, audio_duration_sec=self._audio_duration_sec(audio_path))
         threading.Thread(target=self._transcribe_and_paste, args=(audio_path,), daemon=True).start()
 
     def _transcribe_and_paste(self, audio_path: Path) -> None:
-        self.is_transcribing = True
         start = time.perf_counter()
         try:
             text, language, language_score, total_chunks, mode_name = self._transcribe_selected_file(
@@ -1109,7 +1130,7 @@ class LocalSTTCore:
                 self._set_status("Transcription failed")
                 self._show_popup("TRANSCRIPTION FAILED", bg="#9a1b1b")
         finally:
-            self.is_transcribing = False
+            self._set_transcribing_state(False)
             self.transcription_cancel_event.clear()
 
     def _paste_text(self, text: str) -> None:
@@ -1134,7 +1155,7 @@ class LocalSTTCore:
         time.sleep(max(0.12, self.config.paste_delay_sec))
         self._send_shortcut_vk(0x11, 0x56)
         time.sleep(max(0.12, self.config.paste_delay_sec))
-        self._send_shortcut_vk(0x10, 0x2D)
+        self._release_modifiers()
 
         self.last_pasted_text = text
         self.last_paste_target_hwnd = self.target_hwnd

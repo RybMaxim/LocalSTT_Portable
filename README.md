@@ -59,6 +59,8 @@ Current model options in this project:
 - Ctrl+Shift+W - transcribe the last WAV file
 - Ctrl+Shift+E - exit
 
+Hotkeys are bound to the physical Q / W / E key positions, so they continue to work across keyboard layouts. On a Russian layout these are the same physical keys where Й / Ц / У are printed.
+
 ## Application Window
 
 Size: 450x600
