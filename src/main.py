@@ -23,6 +23,7 @@ from app_core import LocalSTTCore
 CTRL_KEYS = {keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r}
 SHIFT_KEYS = {keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r}
 HOTKEY_SCANS = {
+    0x1E: "cancel_recording",  # Physical A key position
     0x10: "toggle_recording",  # Physical Q key position
     0x11: "transcribe_last",   # Physical W key position
     0x12: "shutdown",          # Physical E key position
@@ -294,11 +295,13 @@ class LocalSTTApp(LocalSTTCore):
         self._log_audio_input_info()
 
         self.hotkey_actions_by_vk: dict[int, tuple[str, Any]] = {
+            0x41: ("cancel_recording", self.cancel_recording),
             0x51: ("toggle_recording", self.toggle_recording),
             0x57: ("transcribe_last", self.transcribe_last_file),
             0x45: ("shutdown", self.shutdown),
         }
         self.hotkey_actions_by_scan: dict[int, tuple[str, Any]] = {
+            0x1E: ("cancel_recording", self.cancel_recording),
             0x10: ("toggle_recording", self.toggle_recording),
             0x11: ("transcribe_last", self.transcribe_last_file),
             0x12: ("shutdown", self.shutdown),
@@ -1130,11 +1133,12 @@ class LocalSTTApp(LocalSTTCore):
         desc.insert(
             "1.0",
             "LocalSTT portable\n\n"
-            "Hotkeys (bound to physical Q / W / E key positions, independent of layout):\n"
+            "Hotkeys (bound to physical A / Q / W / E key positions, independent of layout):\n"
+            "Ctrl+Shift+A - cancel current recording and discard audio\n"
             "Ctrl+Shift+Q - start/stop recording\n"
             "Ctrl+Shift+W - transcribe last recording\n"
             "Ctrl+Shift+E - exit\n\n"
-            "In Russian layout these are the same physical keys where Й / Ц / У are printed.\n\n"
+            "In Russian layout these are the same physical keys where Ф / Й / Ц / У are printed.\n\n"
             "Default mode transcribes the whole recorded WAV after stop.\n"
             "An experimental live-overlap mode is still available through config if you want to compare it later.\n\n"
             "Set a preferred transcription language in settings to avoid language guessing.\n\n"
@@ -1321,7 +1325,7 @@ class LocalSTTApp(LocalSTTCore):
 
     def run(self) -> None:
         logging.info("LocalSTT started")
-        logging.info("Hotkeys: Ctrl+Shift + physical Q/W/E keys (same positions as Й/Ц/У)")
+        logging.info("Hotkeys: Ctrl+Shift + physical A/Q/W/E keys (same positions as Ф/Й/Ц/У)")
         self.hotkeys.start()
         self._build_ui()
         logging.info("LocalSTT stopped")

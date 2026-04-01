@@ -469,6 +469,14 @@ class LocalSTTCore:
             self.recording_audio_frame_count += int(audio_chunk.shape[0])
         self.recording_audio_event.set()
 
+    def _reset_current_recording_buffers(self) -> None:
+        self.audio_chunks.clear()
+        self.audio_queue = queue.Queue()
+        with self.recording_audio_lock:
+            self.recording_audio_bytes = bytearray()
+            self.recording_audio_frame_count = 0
+        self.recording_audio_event.clear()
+
     def _get_recorded_audio_frame_count(self) -> int:
         with self.recording_audio_lock:
             return int(self.recording_audio_frame_count)
@@ -933,12 +941,7 @@ class LocalSTTCore:
             self._show_popup("NO MICROPHONE FOUND", bg="#9a1b1b")
             return
 
-        self.audio_chunks.clear()
-        self.audio_queue = queue.Queue()
-        with self.recording_audio_lock:
-            self.recording_audio_bytes = bytearray()
-            self.recording_audio_frame_count = 0
-        self.recording_audio_event.clear()
+        self._reset_current_recording_buffers()
         self.live_transcription_text = ""
         self.live_transcription_chunk_count = 0
         self.live_transcription_language_scores = {}
@@ -963,6 +966,46 @@ class LocalSTTCore:
             self._set_status("Microphone open failed")
             self._show_popup("MICROPHONE OPEN FAILED", bg="#9a1b1b")
             self._set_transcribing_state(False)
+
+    def cancel_recording(self) -> None:
+        if not self.is_recording:
+            return
+
+        session = getattr(self, "live_mode_session", None)
+
+        try:
+            if self.stream is not None:
+                self.stream.stop()
+                self.stream.close()
+        except Exception:
+            logging.exception("Failed to stop stream while cancelling recording")
+        finally:
+            self.stream = None
+
+        self.is_recording = False
+        self.recording_started_at = None
+
+        if session is not None:
+            self.transcription_cancel_event.set()
+            try:
+                session.finish_recording()
+                session.wait()
+            except Exception:
+                logging.exception("Failed to stop live transcription session during recording cancel")
+
+        self.live_mode_session = None
+        self.live_transcription_text = ""
+        self.live_transcription_chunk_count = 0
+        self.live_transcription_language_scores = {}
+        self.live_transcription_error = None
+        self.live_transcription_cancelled = False
+        self._set_transcribing_state(False)
+        self.transcription_cancel_event.clear()
+        self._reset_current_recording_buffers()
+
+        logging.info("Recording cancelled and discarded")
+        self._set_status("Recording cancelled")
+        self._show_popup("RECORDING CANCELLED", bg="#7d5a11")
 
     def stop_recording(self) -> None:
         if not self.is_recording:
