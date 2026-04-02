@@ -1,3 +1,4 @@
+﻿import gc
 import json
 import logging
 import os
@@ -14,10 +15,26 @@ import numpy as np
 import pyautogui
 import sounddevice as sd
 from faster_whisper import WhisperModel
+from huggingface_hub import snapshot_download
+from huggingface_hub.utils import are_progress_bars_disabled, disable_progress_bars, enable_progress_bars
 from pynput import keyboard
 from pynput.keyboard import Controller
 
 from app_core import LocalSTTCore
+from model_catalog import (
+    MODEL_LABEL_TO_SIZE,
+    MODEL_ORDER,
+    MODEL_REQUIRED_FILES,
+    MODEL_SIZE_TO_LABEL,
+    expected_model_size_bytes,
+    format_model_size,
+    model_description,
+    model_label,
+    model_relative_path,
+    model_repo_id,
+    model_storage_folder_name,
+    normalize_model_size,
+)
 
 
 CTRL_KEYS = {keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r}
@@ -125,6 +142,12 @@ def _normalize_model_size(value: Any, fallback: str = "small") -> str:
         return fallback
     if raw in MODEL_LABEL_TO_CODE:
         return MODEL_LABEL_TO_CODE[raw]
+    if raw in MODEL_LABEL_TO_SIZE:
+        return MODEL_LABEL_TO_SIZE[raw]
+
+    normalized_catalog_value = normalize_model_size(raw, fallback="")
+    if normalized_catalog_value:
+        return normalized_catalog_value
 
     cleaned = raw.lower().replace("_", "-")
     if cleaned in MODEL_CODE_TO_LABEL:
@@ -201,6 +224,9 @@ class QueueLogHandler(logging.Handler):
 class LocalSTTApp(LocalSTTCore):
     def __init__(self, config: AppConfig) -> None:
         self.config = config
+        self.config.model_size = normalize_model_size(self.config.model_size)
+        if not str(self.config.model_path).strip():
+            self.config.model_path = model_relative_path(self.config.model_size)
 
         if getattr(sys, "frozen", False):
             self.project_root = Path(sys.executable).resolve().parent
@@ -210,10 +236,13 @@ class LocalSTTApp(LocalSTTCore):
         local_app_data = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "LocalSTT"
         self.recordings_dir = local_app_data / "recordings"
         self.logs_dir = local_app_data / "logs"
+        self.models_dir = self.project_root / "_internal" / "models" if getattr(sys, "frozen", False) else local_app_data / "models"
+        self.models_dir_label = str(self.models_dir)
         self.settings_file = local_app_data / "settings.json"
         self.history_file = local_app_data / "history.json"
         self.recordings_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.models_dir.mkdir(parents=True, exist_ok=True)
 
         self.log_queue: queue.Queue[str] = queue.Queue()
         self._configure_logging(self.logs_dir / "app.log")
@@ -260,6 +289,9 @@ class LocalSTTApp(LocalSTTCore):
         self.live_transcription_cancelled = False
         self.live_mode_session = None
         self.transcription_history: list[dict[str, Any]] = []
+        self.model_download_in_progress = False
+        self.model_status_cache: dict[str, dict[str, Any]] = {}
+        self.startup_model_notice: str | None = None
 
         self.ui_root = None
         self.ui_log_text = None
@@ -284,12 +316,35 @@ class LocalSTTApp(LocalSTTCore):
         self.ui_repeat_paste_btn = None
         self.ui_undo_paste_btn = None
         self.ui_history_text = None
+        self.ui_model_var = None
+        self.ui_model_combo = None
+        self.ui_model_current_var = None
+        self.ui_model_details_var = None
+        self.ui_model_hint_var = None
+        self.ui_model_action_btn = None
 
         self._load_settings_from_file()
         self._sync_model_config()
         self._load_history_from_file()
 
-        self.model = self._load_whisper_model()
+        if self.config.offline_only:
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+        self._refresh_model_status_cache()
+        try:
+            self.model = self._load_model_instance(self.config.model_size, self.config.model_path)
+        except FileNotFoundError:
+            logging.exception("Configured model is unavailable during startup")
+            if normalize_model_size(self.config.model_size) != "small":
+                missing_label = model_label(self.config.model_size)
+                self.startup_model_notice = f"{missing_label} was unavailable. Switched back to Small (default)."
+                self.config.model_size = "small"
+                self.config.model_path = model_relative_path("small")
+                self.model = self._load_model_instance(self.config.model_size, self.config.model_path)
+                self._save_settings_to_file()
+            else:
+                raise
+        self._refresh_model_status_cache()
 
         self.input_device = self._resolve_input_device(self.config.input_device)
         self._log_audio_input_info()
@@ -424,28 +479,17 @@ class LocalSTTApp(LocalSTTCore):
     def _sync_model_config(self) -> None:
         fallback_model_size = _model_size_from_path(self.config.model_path, fallback="small")
         self.config.model_size = _normalize_model_size(self.config.model_size, fallback=fallback_model_size)
-        if _model_size_from_path(self.config.model_path, fallback=""):
+        configured_model_size = _model_size_from_path(self.config.model_path, fallback="")
+        if configured_model_size:
             self.config.model_path = _model_path_for_size(self.config.model_size)
-
-    def _available_model_codes(self) -> list[str]:
-        available_codes: list[str] = []
-        for code, model_path in MODEL_CODE_TO_PATH.items():
-            if self._resolve_existing_path(model_path) is not None:
-                available_codes.append(code)
-
-        current_code = _normalize_model_size(
-            self.config.model_size,
-            fallback=_model_size_from_path(self.config.model_path, fallback=""),
-        )
-        if current_code and current_code not in available_codes:
-            available_codes.insert(0, current_code)
-
-        return available_codes or list(MODEL_CODE_TO_PATH)
+        elif not str(self.config.model_path).strip():
+            self.config.model_path = _model_path_for_size(self.config.model_size)
 
     def _set_model_ui_value(self, model_size: str) -> None:
         if self.ui_root is None or self.ui_model_var is None:
             return
-        label = _model_display_value(model_size)
+
+        label = MODEL_SIZE_TO_LABEL.get(normalize_model_size(model_size), model_label(model_size))
         try:
             self.ui_root.after(0, lambda: self.ui_model_var.set(label))
         except Exception:
@@ -455,23 +499,12 @@ class LocalSTTApp(LocalSTTCore):
         normalized = _normalize_model_size(model_size, fallback="")
         if not normalized:
             raise ValueError("Unsupported model selection")
+
         self.config.model_size = normalized
         self.config.model_path = _model_path_for_size(normalized)
 
     def _load_whisper_model(self) -> WhisperModel:
-        model_source, local_files_only = self._resolve_model_source()
-        if self.config.offline_only:
-            os.environ.setdefault("HF_HUB_OFFLINE", "1")
-
-        logging.info("Loading faster-whisper model from: %s", model_source)
-        model = WhisperModel(
-            model_source,
-            device=self.config.device,
-            compute_type=self.config.compute_type,
-            local_files_only=local_files_only,
-        )
-        logging.info("Model loaded")
-        return model
+        return self._load_model_instance(self.config.model_size, self.config.model_path)
 
     def _apply_user_settings(
         self,
@@ -499,6 +532,13 @@ class LocalSTTApp(LocalSTTCore):
         if not model_changed:
             self._save_settings_to_file()
             self._set_status("Settings saved")
+            self._refresh_model_ui_async()
+            return
+
+        if self.model_download_in_progress:
+            self._set_model_ui_value(previous_model_size)
+            self._set_status("Wait for the current model download to finish")
+            self._show_popup("MODEL DOWNLOAD IN PROGRESS", bg="#7d5a11")
             return
 
         if self.is_recording or self.is_transcribing:
@@ -508,8 +548,9 @@ class LocalSTTApp(LocalSTTCore):
             self._show_popup("STOP ACTIVE JOB FIRST", bg="#9a1b1b")
             return
 
-        self._set_status(f"Loading {normalized_model_size} model...")
-        self._show_popup(f"LOADING {normalized_model_size.upper()} MODEL", bg="#5d2f87", persistent=True)
+        target_model_label = model_label(normalized_model_size)
+        self._set_status(f"Loading {target_model_label}...")
+        self._show_popup("LOADING MODEL...", bg="#0d5f8a", persistent=True)
 
         try:
             self._apply_selected_model(normalized_model_size)
@@ -519,18 +560,369 @@ class LocalSTTApp(LocalSTTCore):
             self.config.model_path = previous_model_path
             self._save_settings_to_file()
             self._set_model_ui_value(previous_model_size)
+            self._refresh_model_status_cache()
+            self._refresh_model_ui_async()
             self._hide_popup()
             logging.exception("Failed to switch model")
-            self._set_status(f"Failed to load {normalized_model_size} model")
+            self._set_status(f"Failed to load {target_model_label}")
             self._show_popup("MODEL LOAD FAILED", bg="#9a1b1b")
             return
 
+        previous_model = self.model
         self.model = new_model
+
+        try:
+            del previous_model
+            gc.collect()
+        except Exception:
+            pass
+
         self._save_settings_to_file()
+        self._refresh_model_status_cache()
+        self._refresh_model_ui_async()
         self._set_model_ui_value(self.config.model_size)
         self._hide_popup()
-        self._set_status(f"Model switched to {self.config.model_size}")
-        self._show_popup(f"MODEL: {self.config.model_size.upper()}", bg="#1e6b2d")
+        self._set_status(f"Model switched to {target_model_label}")
+        self._show_popup("MODEL READY", bg="#1e6b2d")
+
+    def _load_model_instance(self, model_size: str, model_path: str) -> WhisperModel:
+        resolved_size = normalize_model_size(model_size)
+        resolved_path = str(model_path).strip() or model_relative_path(resolved_size)
+        model_source, local_files_only = self._resolve_model_source(resolved_path, resolved_size)
+        logging.info("Loading faster-whisper model from: %s", model_source)
+        model = WhisperModel(
+            model_source,
+            device=self.config.device,
+            compute_type=self.config.compute_type,
+            local_files_only=local_files_only,
+        )
+        logging.info("Model loaded")
+        return model
+
+    def _model_storage_path(self, model_size: str) -> Path:
+        return self.models_dir / model_storage_folder_name(model_size)
+
+    def _config_model_path(self, model_size: str, model_path: Path | None) -> str:
+        normalized = normalize_model_size(model_size)
+        relative_path = model_relative_path(normalized)
+        if model_path is None:
+            return relative_path
+
+        candidate_roots = self._runtime_roots()
+        relative_candidate = Path(relative_path)
+        for root in candidate_roots:
+            if (root / relative_candidate) == model_path:
+                return relative_path
+            try:
+                if (root / relative_candidate).resolve() == model_path.resolve():
+                    return relative_path
+            except OSError:
+                continue
+
+        return str(model_path)
+
+    def _is_complete_model_folder(self, model_path: Path) -> bool:
+        return model_path.is_dir() and all((model_path / filename).exists() for filename in MODEL_REQUIRED_FILES)
+
+    def _directory_size_bytes(self, root: Path) -> int:
+        total_size = 0
+        for path in root.rglob("*"):
+            if path.is_file():
+                try:
+                    total_size += path.stat().st_size
+                except OSError:
+                    logging.warning("Could not read file size: %s", path)
+        return total_size
+
+    def _resolve_runtime_model_path(self, model_size: str) -> tuple[Path | None, str]:
+        resolved = self._resolve_existing_path(model_relative_path(model_size))
+        if resolved is None or not self._is_complete_model_folder(resolved):
+            return None, "missing"
+        if normalize_model_size(model_size) == "small":
+            return resolved, "bundled"
+        return resolved, "local"
+
+    def _model_source_label(self, source: str) -> str:
+        labels = {
+            "bundled": "Included with the app by default",
+            "downloaded": f"Downloaded to {self.models_dir_label}",
+            "local": "Found in a local models folder",
+            "missing": "Not downloaded yet",
+        }
+        return labels.get(source, source)
+
+    def _build_model_status(self, model_size: str) -> dict[str, Any]:
+        normalized = normalize_model_size(model_size)
+        downloaded_path = self._model_storage_path(normalized)
+        runtime_path, runtime_source = self._resolve_runtime_model_path(normalized)
+        installed_path: Path | None = None
+        source = "missing"
+
+        if normalized == "small":
+            if runtime_path is not None:
+                installed_path = runtime_path
+                source = runtime_source
+            elif self._is_complete_model_folder(downloaded_path):
+                installed_path = downloaded_path
+                source = "downloaded"
+        else:
+            if self._is_complete_model_folder(downloaded_path):
+                installed_path = downloaded_path
+                source = "downloaded"
+            elif runtime_path is not None:
+                installed_path = runtime_path
+                source = runtime_source
+
+        size_bytes = expected_model_size_bytes(normalized)
+        if installed_path is not None:
+            measured_size = self._directory_size_bytes(installed_path)
+            if measured_size > 0:
+                size_bytes = measured_size
+
+        return {
+            "size": normalized,
+            "label": model_label(normalized),
+            "installed": installed_path is not None,
+            "active": normalize_model_size(self.config.model_size) == normalized,
+            "source": source,
+            "status_label": self._model_source_label(source),
+            "path": installed_path,
+            "storage_path": downloaded_path,
+            "config_path": self._config_model_path(normalized, installed_path),
+            "size_bytes": size_bytes,
+        }
+
+    def _refresh_model_status_cache(self) -> None:
+        self.model_status_cache = {model_size: self._build_model_status(model_size) for model_size in MODEL_ORDER}
+
+    def _model_status(self, model_size: str) -> dict[str, Any]:
+        normalized = normalize_model_size(model_size)
+        cached = self.model_status_cache.get(normalized)
+        if cached is not None:
+            return cached
+
+        status = self._build_model_status(normalized)
+        self.model_status_cache[normalized] = status
+        return status
+
+    def _selected_model_size(self) -> str:
+        if self.ui_model_var is None:
+            return normalize_model_size(self.config.model_size)
+        raw_value = self.ui_model_var.get().strip()
+        if raw_value in MODEL_LABEL_TO_SIZE:
+            return MODEL_LABEL_TO_SIZE[raw_value]
+        return normalize_model_size(raw_value, fallback=self.config.model_size)
+
+    def _refresh_model_ui_async(self) -> None:
+        self._refresh_model_status_cache()
+        if self.ui_root is not None:
+            try:
+                self.ui_root.after(0, self._render_model_ui)
+            except Exception:
+                logging.exception("Failed to schedule model UI refresh")
+
+    def _render_model_ui(self) -> None:
+        if self.ui_model_var is None:
+            return
+
+        if not self.model_status_cache:
+            self._refresh_model_status_cache()
+
+        current_size = normalize_model_size(self.config.model_size)
+        current_status = self._model_status(current_size)
+        if self.ui_model_current_var is not None:
+            current_size_text = format_model_size(int(current_status["size_bytes"]))
+            self.ui_model_current_var.set(
+                f"Current model: {current_status['label']} | {current_size_text} | {current_status['status_label']}"
+            )
+
+        selected_size = self._selected_model_size()
+        selected_label = MODEL_SIZE_TO_LABEL.get(selected_size, model_label(selected_size))
+        if self.ui_model_var.get().strip() != selected_label:
+            self.ui_model_var.set(selected_label)
+            selected_size = self._selected_model_size()
+
+        selected_status = self._model_status(selected_size)
+        if self.ui_model_details_var is not None:
+            self.ui_model_details_var.set(
+                f"Selected: {selected_status['label']} | {format_model_size(int(selected_status['size_bytes']))} | "
+                f"{selected_status['status_label']}"
+            )
+
+        self._update_model_controls()
+
+    def _update_model_controls(self) -> None:
+        if self.ui_model_action_btn is None:
+            return
+
+        selected_status = self.model_status_cache.get(self._selected_model_size())
+        if selected_status is None:
+            return
+
+        if self.ui_model_hint_var is not None:
+            if self.model_download_in_progress:
+                self.ui_model_hint_var.set("Downloading the selected model...")
+            elif self.is_recording or self.is_transcribing:
+                self.ui_model_hint_var.set("Finish recording or transcription before changing the model.")
+            else:
+                self.ui_model_hint_var.set("")
+
+        is_busy = self.is_recording or self.is_transcribing or self.model_download_in_progress
+        if self.model_download_in_progress:
+            button_text = "Downloading model..."
+            disabled = True
+        elif selected_status["active"]:
+            button_text = f"{selected_status['label']} is active"
+            disabled = True
+        elif not selected_status["installed"]:
+            button_text = f"Download {selected_status['label']}"
+            disabled = is_busy
+        else:
+            button_text = f"Use {selected_status['label']}"
+            disabled = is_busy
+
+        self.ui_model_action_btn.configure(text=button_text)
+        if disabled:
+            self.ui_model_action_btn.state(["disabled"])
+        else:
+            self.ui_model_action_btn.state(["!disabled"])
+
+    def _ensure_model_change_allowed(self) -> bool:
+        if self.model_download_in_progress:
+            self._set_status("Model download already in progress")
+            self._show_popup("MODEL DOWNLOAD IN PROGRESS", bg="#7d5a11")
+            return False
+        if self.is_recording:
+            self._set_status("Stop recording before changing the model")
+            self._show_popup("STOP RECORDING FIRST", bg="#7d5a11")
+            return False
+        if self.is_transcribing:
+            self._set_status("Wait until transcription finishes before changing the model")
+            self._show_popup("TRANSCRIPTION STILL RUNNING", bg="#7d5a11")
+            return False
+        return True
+
+    def _download_model(self, model_size: str) -> bool:
+        normalized = normalize_model_size(model_size)
+        model_name = model_label(normalized)
+        model_size_text = format_model_size(expected_model_size_bytes(normalized))
+        target_dir = self._model_storage_path(normalized)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        self.model_download_in_progress = True
+        self._refresh_model_ui_async()
+        self._set_status(f"Downloading {model_name} ({model_size_text})...")
+        self._show_popup("DOWNLOADING MODEL...", bg="#0d5f8a", persistent=True)
+        logging.info("Downloading model %s from %s to %s", model_name, model_repo_id(normalized), target_dir)
+
+        previous_offline = os.environ.pop("HF_HUB_OFFLINE", None)
+        progress_bars_were_disabled = are_progress_bars_disabled()
+        try:
+            disable_progress_bars()
+            snapshot_download(
+                repo_id=model_repo_id(normalized),
+                local_dir=str(target_dir),
+                local_dir_use_symlinks=False,
+                resume_download=True,
+            )
+            if not self._is_complete_model_folder(target_dir):
+                raise RuntimeError(f"Downloaded model is incomplete: {target_dir}")
+            logging.info("Model download completed: %s", target_dir)
+            self._set_status(f"Downloaded {model_name}")
+            self._show_popup("MODEL DOWNLOADED", bg="#1e6b2d")
+            return True
+        except Exception:
+            logging.exception("Failed to download model: %s", model_name)
+            self._set_status(f"Download failed for {model_name}")
+            self._show_popup("MODEL DOWNLOAD FAILED", bg="#9a1b1b")
+            return False
+        finally:
+            if previous_offline is not None:
+                os.environ["HF_HUB_OFFLINE"] = previous_offline
+            elif self.config.offline_only:
+                os.environ["HF_HUB_OFFLINE"] = "1"
+            if not progress_bars_were_disabled:
+                enable_progress_bars()
+            self.model_download_in_progress = False
+            self._refresh_model_ui_async()
+
+    def _activate_model(self, model_size: str) -> bool:
+        normalized = normalize_model_size(model_size)
+        status = self._model_status(normalized)
+        if not status["installed"]:
+            self._set_status(f"{status['label']} is not available locally")
+            self._show_popup("MODEL NOT AVAILABLE", bg="#9a1b1b")
+            return False
+
+        model_name = status["label"]
+        model_path = str(status["config_path"])
+        self._set_status(f"Loading {model_name}...")
+        self._show_popup("LOADING MODEL...", bg="#0d5f8a", persistent=True)
+
+        try:
+            new_model = self._load_model_instance(normalized, model_path)
+        except Exception:
+            logging.exception("Failed to activate model: %s", model_name)
+            self._set_status(f"Failed to load {model_name}")
+            self._show_popup("MODEL LOAD FAILED", bg="#9a1b1b")
+            return False
+
+        previous_model = self.model
+        self.model = new_model
+        self.config.model_size = normalized
+        self.config.model_path = model_path
+        self._save_settings_to_file()
+
+        try:
+            del previous_model
+            gc.collect()
+        except Exception:
+            pass
+
+        self._refresh_model_ui_async()
+        self._set_status(f"Active model: {model_name}")
+        self._show_popup("MODEL READY", bg="#1e6b2d")
+        return True
+
+    def _handle_selected_model_action(self) -> None:
+        if not self._ensure_model_change_allowed():
+            return
+
+        selected_size = self._selected_model_size()
+        selected_status = self._model_status(selected_size)
+        if not selected_status["installed"]:
+            if not self._download_model(selected_size):
+                return
+            self._refresh_model_status_cache()
+            selected_status = self._model_status(selected_size)
+
+        if selected_status["active"]:
+            self._set_status(f"{selected_status['label']} is already active")
+            self._show_popup("MODEL ALREADY ACTIVE", bg="#7d5a11")
+            return
+
+        self._activate_model(selected_size)
+
+    def _refresh_model_statuses(self) -> None:
+        self._refresh_model_status_cache()
+        self._set_status("Model list refreshed")
+        self._refresh_model_ui_async()
+
+    def _disable_combobox_mousewheel(self, widget, scroll_handler=None) -> None:
+        def _handle(event):
+            if callable(scroll_handler):
+                scroll_handler(event)
+            return "break"
+
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            widget.bind(sequence, _handle)
+
+    def _bind_mousewheel_scroll(self, widget, scroll_handler) -> None:
+        if widget.winfo_class() not in {"TCombobox", "Combobox"}:
+            for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                widget.bind(sequence, scroll_handler, add="+")
+        for child in widget.winfo_children():
+            self._bind_mousewheel_scroll(child, scroll_handler)
 
     def _load_settings_from_file(self) -> None:
         try:
@@ -541,8 +933,12 @@ class LocalSTTApp(LocalSTTCore):
             self.config.input_device = data.get("input_device", self.config.input_device)
             self.config.vad_filter = bool(data.get("vad_filter", self.config.vad_filter))
             self.config.restore_clipboard = bool(data.get("restore_clipboard", self.config.restore_clipboard))
-            self.config.model_size = str(data.get("model_size", self.config.model_size))
-            self.config.model_path = str(data.get("model_path", self.config.model_path))
+            self.config.model_size = normalize_model_size(
+                data.get("model_size", self.config.model_size),
+                fallback=self.config.model_size,
+            )
+            saved_model_path = str(data.get("model_path", self.config.model_path)).strip()
+            self.config.model_path = saved_model_path or model_relative_path(self.config.model_size)
             self.config.transcription_mode = _normalize_transcription_mode(
                 data.get("transcription_mode", self.config.transcription_mode),
                 fallback=self.config.transcription_mode,
@@ -906,20 +1302,69 @@ class LocalSTTApp(LocalSTTCore):
         self._set_status(f"Microphone selected: {idx}")
         self._log_audio_input_info()
 
+    def _rescan_audio_devices(self) -> None:
+        terminate = getattr(sd, "_terminate", None)
+        initialize = getattr(sd, "_initialize", None)
+        if not callable(terminate) or not callable(initialize):
+            return
+
+        try:
+            terminate()
+            initialize()
+        except Exception:
+            logging.exception("Failed to reinitialize audio backend during microphone refresh")
+
     def _refresh_mic_devices(self) -> None:
         if self.ui_mic_combo is None:
             return
+
+        if self.is_recording:
+            self._set_status("Stop recording before refreshing microphones")
+            return
+
+        if self.mic_monitor_stream is not None:
+            self._stop_mic_test()
+            if self.ui_mic_test_btn is not None:
+                self.ui_mic_test_btn.configure(text="Test microphone")
+
+        self._rescan_audio_devices()
+
         items = [f"{idx}: {name}" for idx, name in self._input_devices_list()]
         self.ui_mic_combo["values"] = items
+
+        previously_selected = str(self.config.input_device) if self.config.input_device is not None else ""
+        selected_item = ""
 
         selected = str(self.config.input_device) if self.config.input_device is not None else ""
         if selected:
             for item in items:
                 if item.startswith(f"{selected}:"):
-                    self.ui_mic_var.set(item)
+                    selected_item = item
                     break
-        elif items:
-            self.ui_mic_var.set(items[0])
+
+        if not selected_item and selected:
+            self.config.input_device = None
+            self.input_device = None
+            self._save_settings_to_file()
+
+        if not selected_item:
+            effective = self._get_effective_input_device()
+            if effective is not None:
+                for item in items:
+                    if item.startswith(f"{effective}:"):
+                        selected_item = item
+                        break
+
+        if not selected_item and items:
+            selected_item = items[0]
+
+        if self.ui_mic_var is not None:
+            self.ui_mic_var.set(selected_item)
+
+        if selected_item and (not previously_selected or not selected_item.startswith(f"{previously_selected}:")):
+            self._apply_selected_mic()
+        else:
+            self._set_status("Microphone list refreshed")
 
     def _copy_text_widget_selection(self, widget) -> str:
         try:
@@ -941,9 +1386,9 @@ class LocalSTTApp(LocalSTTCore):
 
         if keycode == 67:
             return self._copy_text_widget_selection(widget)
-        if keysym in {"c", "с", "cyrillic_es"}:
+        if keysym in {"c", "СЃ", "cyrillic_es"}:
             return self._copy_text_widget_selection(widget)
-        if char in {"c", "с"}:
+        if char in {"c", "СЃ"}:
             return self._copy_text_widget_selection(widget)
         return None
 
@@ -985,6 +1430,7 @@ class LocalSTTApp(LocalSTTCore):
         self._process_popup_queue()
         self._update_recording_popup_timer()
         self._update_recovery_buttons()
+        self._update_model_controls()
 
         self.ui_root.after(100, self._ui_poll)
 
@@ -1011,8 +1457,8 @@ class LocalSTTApp(LocalSTTCore):
         style.map(
             "App.TNotebook.Tab",
             background=[
-                ("selected", "#ffffff"),
-                ("active", "#f5f5f5"),
+                ("selected", default_bg),
+                ("active", default_bg),
             ],
             foreground=[
                 ("selected", "#1f1f1f"),
@@ -1022,7 +1468,7 @@ class LocalSTTApp(LocalSTTCore):
         )
         style.configure(
             "TabBody.TFrame",
-            background="#ffffff",
+            background=default_bg,
             borderwidth=1,
             relief="solid",
         )
@@ -1138,10 +1584,11 @@ class LocalSTTApp(LocalSTTCore):
             "Ctrl+Shift+Q - start/stop recording\n"
             "Ctrl+Shift+W - transcribe last recording\n"
             "Ctrl+Shift+E - exit\n\n"
-            "In Russian layout these are the same physical keys where Ф / Й / Ц / У are printed.\n\n"
+            "In Russian layout these are the same physical keys where Р¤ / Р™ / Р¦ / РЈ are printed.\n\n"
             "Default mode transcribes the whole recorded WAV after stop.\n"
             "An experimental live-overlap mode is still available through config if you want to compare it later.\n\n"
             "Set a preferred transcription language in settings to avoid language guessing.\n\n"
+            "Use the compact model controls in the Microphone tab to switch or download Tiny, Small, and Medium.\n\n"
             "How it works:\n"
             "1) Start recording with a hotkey.\n"
             "2) In stable mode, after stop the full WAV is sent to faster-whisper.\n"
@@ -1152,19 +1599,61 @@ class LocalSTTApp(LocalSTTCore):
         desc.configure(state="disabled")
         self._bind_readonly_text_widget(desc)
 
-        mic_frame = ttk.Frame(tab_mic, padding=6)
-        mic_frame.pack(fill="both", expand=True)
+        mic_scroll_frame = ttk.Frame(tab_mic)
+        mic_scroll_frame.pack(fill="both", expand=True)
+
+        mic_canvas = tk.Canvas(
+            mic_scroll_frame,
+            background=root.cget("bg"),
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        mic_scrollbar = ttk.Scrollbar(mic_scroll_frame, orient="vertical", command=mic_canvas.yview)
+        mic_canvas.configure(yscrollcommand=mic_scrollbar.set)
+        mic_canvas.pack(side="left", fill="both", expand=True)
+        mic_scrollbar.pack(side="right", fill="y")
+
+        mic_frame = ttk.Frame(mic_canvas, padding=6, style="TabBody.TFrame")
+        mic_window = mic_canvas.create_window((0, 0), window=mic_frame, anchor="nw")
+
+        def _update_mic_scrollregion(_event=None) -> None:
+            bbox = mic_canvas.bbox("all")
+            if bbox is not None:
+                mic_canvas.configure(scrollregion=bbox)
+
+        def _resize_mic_window(event) -> None:
+            mic_canvas.itemconfigure(mic_window, width=event.width)
+
+        def _scroll_mic_tab(event):
+            step = 0
+            delta = getattr(event, "delta", 0)
+            if delta:
+                step = -1 if delta > 0 else 1
+            else:
+                button_num = getattr(event, "num", None)
+                if button_num == 4:
+                    step = -1
+                elif button_num == 5:
+                    step = 1
+
+            if step != 0:
+                mic_canvas.yview_scroll(step, "units")
+            return "break"
+
+        mic_frame.bind("<Configure>", _update_mic_scrollregion)
+        mic_canvas.bind("<Configure>", _resize_mic_window)
 
         ttk.Label(mic_frame, text="Input device:").pack(anchor="w")
         self.ui_mic_var = tk.StringVar()
         mic_combo = ttk.Combobox(mic_frame, textvariable=self.ui_mic_var, state="readonly")
         mic_combo.pack(fill="x", pady=(2, 6))
+        mic_combo.bind("<<ComboboxSelected>>", lambda _event: self._apply_selected_mic())
+        self._disable_combobox_mousewheel(mic_combo, _scroll_mic_tab)
         self.ui_mic_combo = mic_combo
 
         row = ttk.Frame(mic_frame)
         row.pack(fill="x", pady=(0, 6))
         ttk.Button(row, text="Refresh", command=self._refresh_mic_devices).pack(side="left")
-        ttk.Button(row, text="Select", command=self._apply_selected_mic).pack(side="left", padx=(6, 0))
 
         self.ui_mic_level_var = tk.DoubleVar(value=0.0)
         ttk.Label(mic_frame, text="Input level:").pack(anchor="w", pady=(6, 2))
@@ -1175,22 +1664,7 @@ class LocalSTTApp(LocalSTTCore):
 
         self.ui_vad_var = tk.BooleanVar(value=self.config.vad_filter)
         self.ui_restore_clipboard_var = tk.BooleanVar(value=self.config.restore_clipboard)
-        self.ui_model_var = tk.StringVar(value=_model_display_value(self.config.model_size))
         self.ui_language_var = tk.StringVar(value=_language_display_value(self.config.transcription_language))
-
-        ttk.Label(mic_frame, text="Speech model:").pack(anchor="w", pady=(8, 2))
-        model_combo = ttk.Combobox(
-            mic_frame,
-            textvariable=self.ui_model_var,
-            values=[_model_display_value(code) for code in self._available_model_codes()],
-            state="readonly",
-        )
-        model_combo.pack(fill="x")
-        self.ui_model_combo = model_combo
-        ttk.Label(
-            mic_frame,
-            text="Only locally downloaded models are listed. Switching reloads the model and can take a few seconds.",
-        ).pack(anchor="w", pady=(2, 6))
 
         ttk.Label(mic_frame, text="Preferred transcription language:").pack(anchor="w", pady=(8, 2))
         language_combo = ttk.Combobox(
@@ -1199,11 +1673,61 @@ class LocalSTTApp(LocalSTTCore):
             values=[label for label, _code in COMMON_LANGUAGE_OPTIONS],
         )
         language_combo.pack(fill="x")
+        self._disable_combobox_mousewheel(language_combo, _scroll_mic_tab)
         self.ui_language_combo = language_combo
         ttk.Label(
             mic_frame,
             text="Use Auto detect or type a Whisper language code such as en, ru, es.",
         ).pack(anchor="w", pady=(2, 6))
+
+        ttk.Label(mic_frame, text="Speech model:").pack(anchor="w", pady=(8, 2))
+
+        self.ui_model_current_var = tk.StringVar(value="")
+        ttk.Label(
+            mic_frame,
+            textvariable=self.ui_model_current_var,
+            wraplength=450,
+            justify="left",
+        ).pack(anchor="w", fill="x", pady=(0, 2))
+
+        model_row = ttk.Frame(mic_frame)
+        model_row.pack(fill="x", pady=(0, 2))
+
+        self.ui_model_var = tk.StringVar(value=MODEL_SIZE_TO_LABEL.get(self.config.model_size, model_label(self.config.model_size)))
+        model_combo = ttk.Combobox(
+            model_row,
+            textvariable=self.ui_model_var,
+            values=[MODEL_SIZE_TO_LABEL[size] for size in MODEL_ORDER],
+            state="readonly",
+        )
+        model_combo.pack(side="left", fill="x", expand=True)
+        model_combo.bind("<<ComboboxSelected>>", lambda _event: self._render_model_ui())
+        self._disable_combobox_mousewheel(model_combo, _scroll_mic_tab)
+        self.ui_model_combo = model_combo
+
+        action_btn = ttk.Button(
+            model_row,
+            text="Use model",
+            command=lambda: self._dispatch_ui_action("selected_model_action", self._handle_selected_model_action),
+        )
+        action_btn.pack(side="left", padx=(6, 0))
+        self.ui_model_action_btn = action_btn
+
+        self.ui_model_details_var = tk.StringVar(value="")
+        ttk.Label(
+            mic_frame,
+            textvariable=self.ui_model_details_var,
+            wraplength=450,
+            justify="left",
+        ).pack(anchor="w", fill="x", pady=(0, 2))
+
+        self.ui_model_hint_var = tk.StringVar(value="")
+        ttk.Label(
+            mic_frame,
+            textvariable=self.ui_model_hint_var,
+            wraplength=450,
+            justify="left",
+        ).pack(anchor="w", fill="x", pady=(0, 6))
 
         def _apply_simple_settings() -> None:
             selected_language = _normalize_transcription_language(
@@ -1229,7 +1753,7 @@ class LocalSTTApp(LocalSTTCore):
             if self.ui_language_var is not None:
                 self.ui_language_var.set(_language_display_value(selected_language))
             if self.ui_model_var is not None:
-                self.ui_model_var.set(_model_display_value(selected_model))
+                self.ui_model_var.set(MODEL_SIZE_TO_LABEL.get(selected_model, model_label(selected_model)))
             self._dispatch_ui_action(
                 "save_settings",
                 lambda: self._apply_user_settings(
@@ -1247,6 +1771,8 @@ class LocalSTTApp(LocalSTTCore):
             variable=self.ui_restore_clipboard_var,
         ).pack(anchor="w")
         ttk.Button(mic_frame, text="Save settings", command=_apply_simple_settings).pack(fill="x", pady=(6, 0))
+
+        self._bind_mousewheel_scroll(mic_frame, _scroll_mic_tab)
 
         recovery_frame = ttk.LabelFrame(container, text="Recovery actions", padding=6)
         recovery_frame.pack(fill="x", pady=(6, 0))
@@ -1286,6 +1812,12 @@ class LocalSTTApp(LocalSTTCore):
         self._refresh_mic_devices()
         self._refresh_history_view()
         self._update_recovery_buttons()
+        self._render_model_ui()
+
+        if self.startup_model_notice:
+            self._set_status(self.startup_model_notice)
+            self._show_popup("MODEL FALLBACK TO SMALL", bg="#7d5a11")
+
         notebook.select(tab_logs)
 
         def _on_close() -> None:
@@ -1325,7 +1857,7 @@ class LocalSTTApp(LocalSTTCore):
 
     def run(self) -> None:
         logging.info("LocalSTT started")
-        logging.info("Hotkeys: Ctrl+Shift + physical A/Q/W/E keys (same positions as Ф/Й/Ц/У)")
+        logging.info("Hotkeys: Ctrl+Shift + physical A/Q/W/E keys (same positions as Р¤/Р™/Р¦/РЈ)")
         self.hotkeys.start()
         self._build_ui()
         logging.info("LocalSTT stopped")
@@ -1352,10 +1884,11 @@ def main() -> None:
 
     transcription_language = _normalize_transcription_language(os.environ.get("LOCALSTT_LANGUAGE", "auto"))
     transcription_mode = _normalize_transcription_mode(os.environ.get("LOCALSTT_MODE", "full-file"))
+    configured_model_size = normalize_model_size(os.environ.get("LOCALSTT_MODEL", "small"))
 
     config = AppConfig(
-        model_size=os.environ.get("LOCALSTT_MODEL", "small"),
-        model_path=os.environ.get("LOCALSTT_MODEL_PATH", "models/faster-whisper-small"),
+        model_size=configured_model_size,
+        model_path=os.environ.get("LOCALSTT_MODEL_PATH", model_relative_path(configured_model_size)),
         offline_only=offline_only,
         compute_type=os.environ.get("LOCALSTT_COMPUTE", "int8"),
         device=os.environ.get("LOCALSTT_DEVICE", "auto"),
@@ -1368,7 +1901,7 @@ def main() -> None:
     )
 
     if "LOCALSTT_MODEL_PATH" not in os.environ:
-        config.model_path = _model_path_for_size(config.model_size)
+        config.model_path = model_relative_path(config.model_size)
 
     app = LocalSTTApp(config)
     app.run()

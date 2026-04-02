@@ -284,8 +284,11 @@ class LocalSTTCore:
                 return candidate
         return None
 
-    def _resolve_model_source(self):
-        model_path = Path(self.config.model_path)
+    def _resolve_model_source(self, model_path_value: str | None = None, model_size_value: str | None = None):
+        configured_model_path = model_path_value if model_path_value is not None else self.config.model_path
+        configured_model_size = model_size_value if model_size_value is not None else self.config.model_size
+
+        model_path = Path(configured_model_path)
         if not model_path.is_absolute():
             found = self._resolve_existing_path(str(model_path))
             if found is not None:
@@ -301,7 +304,7 @@ class LocalSTTCore:
                 f"Offline model not found at '{model_path}'. Download model once before startup."
             )
 
-        return self.config.model_size, False
+        return configured_model_size, False
 
     def _audio_duration_sec(self, audio_path: Path) -> float | None:
         try:
