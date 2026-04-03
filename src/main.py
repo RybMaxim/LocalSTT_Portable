@@ -1253,14 +1253,10 @@ class LocalSTTApp(LocalSTTCore):
             if device is None:
                 self._set_status("No microphone available")
                 return
-            self.mic_monitor_stream = sd.InputStream(
-                samplerate=self.config.sample_rate,
-                channels=self.config.channels,
-                dtype=self.config.dtype,
-                device=device,
+            self.mic_monitor_stream, chosen_device, chosen_rate = self._open_input_stream_with_fallback(
                 callback=self._mic_test_callback,
             )
-            self.mic_monitor_stream.start()
+            logging.info("Microphone test enabled (device=%s, samplerate=%s)", chosen_device, chosen_rate)
             self._set_status("Microphone test enabled")
         except Exception:
             logging.exception("Failed to start mic test")
@@ -1282,12 +1278,12 @@ class LocalSTTApp(LocalSTTCore):
     def _toggle_mic_test(self) -> None:
         if self.mic_monitor_stream is None:
             self._start_mic_test()
-            if self.ui_mic_test_btn is not None:
-                self.ui_mic_test_btn.configure(text="Stop test")
         else:
             self._stop_mic_test()
-            if self.ui_mic_test_btn is not None:
-                self.ui_mic_test_btn.configure(text="Test microphone")
+
+        if self.ui_mic_test_btn is not None:
+            button_text = "Stop test" if self.mic_monitor_stream is not None else "Test microphone"
+            self.ui_mic_test_btn.configure(text=button_text)
 
     def _apply_selected_mic(self) -> None:
         if self.ui_mic_var is None:

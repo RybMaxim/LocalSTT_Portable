@@ -410,7 +410,8 @@ class LocalSTTCore:
                 candidates.append(sr)
         return candidates
 
-    def _open_input_stream_with_fallback(self):
+    def _open_input_stream_with_fallback(self, callback=None):
+        stream_callback = self._audio_callback if callback is None else callback
         last_error = None
         for device in self._iter_input_device_candidates():
             for rate in self._sample_rate_candidates(device):
@@ -426,7 +427,7 @@ class LocalSTTCore:
                         channels=self.config.channels,
                         dtype=self.config.dtype,
                         device=device,
-                        callback=self._audio_callback,
+                        callback=stream_callback,
                     )
                     stream.start()
                     return stream, device, rate
