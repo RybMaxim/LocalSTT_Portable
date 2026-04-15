@@ -69,6 +69,7 @@ The `Microphone` tab is scrollable and contains the main working controls.
 - Microphone test button
 - Preferred transcription language selector
 - Compact speech-model selector and action button
+- Conditional AssemblyAI API key input when AssemblyAI is selected
 - `VAD filter` checkbox
 - `Restore clipboard` checkbox
 - `Save settings` button
@@ -93,13 +94,14 @@ LocalSTT uses multilingual Whisper models through `faster-whisper` and the CTran
 
 ### Model Strategy
 
-The current app supports three model sizes:
+The current app supports three local Whisper sizes plus one cloud provider option:
 
 | Model | Approx. Size | Availability | Typical Tradeoff |
 | --- | ---: | --- | --- |
 | `tiny` | 74.6 MB | Download from UI | Fastest, lowest recognition quality |
 | `small` | 463.7 MB | Bundled by default | Best default balance of speed and quality |
 | `medium` | 1459.7 MB | Download from UI | Better recognition quality, slower and heavier |
+| `AssemblyAI` | Cloud | Requires user API key | Uses AssemblyAI Universal-3 Pro with Universal-2 fallback |
 
 ### Default Model
 
@@ -175,6 +177,8 @@ In practice this means:
 - transcription itself is local
 - cloud speech APIs are not used
 - internet is only needed when downloading a model that is not already available locally
+
+If you manually switch the speech model to `AssemblyAI`, transcription uses the AssemblyAI cloud API instead. In that mode, you must enter your own API key in the `Microphone` tab.
 
 ### Startup Fallback
 

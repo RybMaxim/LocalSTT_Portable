@@ -5,3 +5,4 @@ pynput==1.8.1
 pyperclip==1.11.0
 pyautogui==0.9.54
 huggingface_hub==1.7.1
+assemblyai==0.61.0
